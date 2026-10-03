@@ -42,6 +42,8 @@ struct viommu_dev {
 	spinlock_t			request_lock;
 	struct list_head		requests;
 	void				*evts;
+	/* Set when the virtqueues are gone: nothing may be queued or drained */
+	bool				removed;
 
 	/* Device configuration */
 	struct iommu_domain_geometry	geometry;
@@ -114,6 +116,16 @@ static struct viommu_domain viommu_identity_domain;
 
 #define to_viommu_domain(domain)	\
 	container_of(domain, struct viommu_domain, domain)
+
+/*
+ * The device can be removed while its domains still exist (userspace may hold
+ * them for a while), and the queues go away with it: nothing may be queued or
+ * drained after that.
+ */
+static bool viommu_device_live(struct viommu_dev *viommu)
+{
+	return viommu && !viommu->removed;
+}
 
 static int viommu_get_req_errno(void *buf, size_t len)
 {
@@ -205,6 +217,10 @@ static int viommu_sync_req(struct viommu_dev *viommu)
 	unsigned long flags;
 
 	spin_lock_irqsave(&viommu->request_lock, flags);
+	if (!viommu_device_live(viommu)) {
+		spin_unlock_irqrestore(&viommu->request_lock, flags);
+		return 0;
+	}
 	ret = __viommu_sync_req(viommu);
 	if (ret)
 		dev_dbg(viommu->dev, "could not sync requests (%d)\n", ret);
@@ -227,6 +243,9 @@ static int __viommu_queue_req(struct viommu_dev *viommu,
 	struct virtqueue *vq = viommu->vqs[VIOMMU_REQUEST_VQ];
 
 	assert_spin_locked(&viommu->request_lock);
+
+	if (!viommu_device_live(viommu))
+		return -ENODEV;
 
 	sg_init_one(&top_sg, req->buf, write_offset);
 	sg_init_one(&bottom_sg, req->buf + write_offset,
@@ -1470,6 +1489,15 @@ static void viommu_remove(struct virtio_device *vdev)
 
 	iommu_device_sysfs_remove(&viommu->iommu);
 	iommu_device_unregister(&viommu->iommu);
+
+	/*
+	 * The queues go away here: nothing may be queued or drained from now
+	 * on.  Taking request_lock is what tells a drain in flight that it has
+	 * to finish before the teardown, since the drain holds it throughout.
+	 */
+	spin_lock_irq(&viommu->request_lock);
+	viommu->removed = true;
+	spin_unlock_irq(&viommu->request_lock);
 
 	/* Stop all virtqueues */
 	virtio_reset_device(vdev);
