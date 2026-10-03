@@ -70,6 +70,15 @@ struct viommu_mapping {
 	struct viommu_request		*unmap_req;
 };
 
+/* Where a queued request reports a rejection, or NULL */
+struct viommu_req_status {
+	bool				*rejected;
+	/* Errno to treat as success (a replayed MAP may be a duplicate) */
+	int				ignore_errno;
+	/* The first error the device reported, for the caller to return */
+	int				err;
+};
+
 struct viommu_domain {
 	struct iommu_domain		domain;
 	struct viommu_dev		*viommu;
@@ -100,6 +109,8 @@ struct viommu_request {
 	void				*writeback;
 	unsigned int			write_offset;
 	unsigned int			len;
+	/* Where to report a failure of this request, or NULL */
+	struct viommu_req_status	*status;
 	char				buf[] __counted_by(len);
 };
 
@@ -138,6 +149,19 @@ static bool viommu_domain_has_endpoint(struct viommu_domain *vdomain)
 	spin_unlock_irqrestore(&vdomain->mappings_lock, flags);
 
 	return has;
+}
+
+/* Same, for callers that do not hold request_lock */
+static bool viommu_device_alive(struct viommu_dev *viommu)
+{
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&viommu->request_lock, flags);
+	live = viommu_device_live(viommu);
+	spin_unlock_irqrestore(&viommu->request_lock, flags);
+
+	return live;
 }
 
 static int viommu_get_req_errno(void *buf, size_t len)
@@ -211,6 +235,16 @@ static int __viommu_sync_req(struct viommu_dev *viommu)
 		if (!len)
 			viommu_set_req_status(req->buf, req->len,
 					      VIRTIO_IOMMU_S_IOERR);
+
+		if (req->status) {
+			int err = viommu_get_req_errno(req->buf, req->len);
+
+			if (err && err != req->status->ignore_errno) {
+				*req->status->rejected = true;
+				if (!req->status->err)
+					req->status->err = err;
+			}
+		}
 
 		write_len = req->len - req->write_offset;
 		if (req->writeback && len == write_len)
@@ -292,7 +326,7 @@ static int __viommu_queue_req(struct viommu_dev *viommu,
  * Return 0 if the request was successfully added to the queue.
  */
 static int __viommu_add_req(struct viommu_dev *viommu, void *buf, size_t len,
-			    bool writeback)
+			    bool writeback, struct viommu_req_status *status)
 {
 	int ret;
 	off_t write_offset;
@@ -309,6 +343,7 @@ static int __viommu_add_req(struct viommu_dev *viommu, void *buf, size_t len,
 		return -ENOMEM;
 
 	req->len = len;
+	req->status = status;
 	if (writeback) {
 		req->writeback = buf + write_offset;
 		req->write_offset = write_offset;
@@ -322,13 +357,14 @@ static int __viommu_add_req(struct viommu_dev *viommu, void *buf, size_t len,
 	return ret;
 }
 
-static int viommu_add_req(struct viommu_dev *viommu, void *buf, size_t len)
+static int viommu_add_req(struct viommu_dev *viommu, void *buf, size_t len,
+			  struct viommu_req_status *status)
 {
 	int ret;
 	unsigned long flags;
 
 	spin_lock_irqsave(&viommu->request_lock, flags);
-	ret = __viommu_add_req(viommu, buf, len, false);
+	ret = __viommu_add_req(viommu, buf, len, false, status);
 	if (ret)
 		dev_dbg(viommu->dev, "could not add request: %d\n", ret);
 	spin_unlock_irqrestore(&viommu->request_lock, flags);
@@ -351,6 +387,7 @@ static int viommu_queue_prealloc_req(struct viommu_dev *viommu,
 
 	spin_lock_irqsave(&viommu->request_lock, flags);
 	req->len = len;
+	req->status = NULL;
 	req->writeback = NULL;
 	memcpy(req->buf, buf, write_offset);
 	ret = __viommu_queue_req(viommu, req, write_offset);
@@ -371,7 +408,7 @@ static int viommu_send_req_sync(struct viommu_dev *viommu, void *buf,
 
 	spin_lock_irqsave(&viommu->request_lock, flags);
 
-	ret = __viommu_add_req(viommu, buf, len, true);
+	ret = __viommu_add_req(viommu, buf, len, true, NULL);
 	if (ret) {
 		dev_dbg(viommu->dev, "could not add request (%d)\n", ret);
 		goto out_unlock;
@@ -459,7 +496,7 @@ static int viommu_add_mapping(struct viommu_domain *vdomain, u64 iova, u64 end,
 			.flags		= cpu_to_le32(flags),
 		};
 
-		ret = viommu_add_req(vdomain->viommu, &map, sizeof(map));
+		ret = viommu_add_req(vdomain->viommu, &map, sizeof(map), NULL);
 		if (ret) {
 			interval_tree_remove(&mapping->iova, &vdomain->mappings);
 			spin_unlock_irqrestore(&vdomain->mappings_lock, irqflags);
@@ -651,23 +688,56 @@ err_unmap:
 }
 
 /*
- * viommu_replay_mappings - re-send MAP requests
+ * viommu_replay_mappings - send every mapping of the domain again
  *
- * When reattaching a domain that was previously detached from all endpoints,
- * mappings were deleted from the device. Re-create the mappings available in
- * the internal tree.
+ * Used when reattaching a domain that was previously detached from all
+ * endpoints: the device dropped its copy then (it frees a domain together with
+ * its last endpoint).
+ *
+ * The device is not waited for between mappings: they are all queued, one per
+ * mappings_lock section, and waited for once at the end.  A full virtqueue is
+ * the only wait in the loop, so it bounds a single lock hold rather than the
+ * whole walk.  A device answers a duplicate MAP with S_INVAL, which the spec
+ * makes a no-op, so a mapping that was sent concurrently is harmless.
+ *
+ * A rejected MAP is reported by returning an error, which fails the attach: the
+ * domain would be missing a mapping its driver believes in.  Nothing else is
+ * done about it.
  */
 static int viommu_replay_mappings(struct viommu_domain *vdomain)
 {
-	int ret = 0;
+	bool rejected = false;
+	struct viommu_req_status status = {
+		.rejected	= &rejected,
+		.ignore_errno	= -EINVAL,
+	};
 	unsigned long flags;
-	struct viommu_mapping *mapping;
-	struct interval_tree_node *node;
-	struct virtio_iommu_req_map map;
+	int ret = 0;
+	struct interval_tree_node *node = NULL;
 
-	spin_lock_irqsave(&vdomain->mappings_lock, flags);
-	node = interval_tree_iter_first(&vdomain->mappings, 0, -1UL);
-	while (node) {
+	/*
+	 * A single pass is enough: the endpoint was published before this ran,
+	 * so a mapping inserted while the walk progresses is queued by
+	 * map_pages() itself, and one inserted before it is in the tree when
+	 * the walk starts.  A mapping removed meanwhile is simply not there any
+	 * more, and its UNMAP was queued in the same section that removed it,
+	 * so it cannot end up after a MAP this walk sends.
+	 */
+	u64 next_iova = 0;
+	bool done = false;
+
+	while (!done) {
+		struct viommu_mapping *mapping;
+		struct virtio_iommu_req_map map;
+
+		spin_lock_irqsave(&vdomain->mappings_lock, flags);
+		node = interval_tree_iter_first(&vdomain->mappings, next_iova,
+						-1UL);
+		if (!node) {
+			spin_unlock_irqrestore(&vdomain->mappings_lock, flags);
+			break;
+		}
+
 		mapping = container_of(node, struct viommu_mapping, iova);
 		map = (struct virtio_iommu_req_map) {
 			.head.type	= VIRTIO_IOMMU_T_MAP,
@@ -677,16 +747,35 @@ static int viommu_replay_mappings(struct viommu_domain *vdomain)
 			.phys_start	= cpu_to_le64(mapping->paddr),
 			.flags		= cpu_to_le32(mapping->flags),
 		};
+		ret = viommu_add_req(vdomain->viommu, &map, sizeof(map), &status);
 
-		ret = viommu_send_req_sync(vdomain->viommu, &map, sizeof(map));
+		if (mapping->iova.last == ULONG_MAX)
+			done = true;
+		else
+			next_iova = mapping->iova.last + 1;
+		spin_unlock_irqrestore(&vdomain->mappings_lock, flags);
+
 		if (ret)
 			break;
-
-		node = interval_tree_iter_next(node, 0, -1UL);
 	}
-	spin_unlock_irqrestore(&vdomain->mappings_lock, flags);
 
-	return ret;
+	/* Wait for all of them outside the lock: this is the batched drain */
+	viommu_sync_req(vdomain->viommu);
+
+	/*
+	 * A device that went away did not take anything: the status pointers of
+	 * the requests still queued are on this frame, so report it here rather
+	 * than pretending the replay delivered the mappings.
+	 */
+	if (!viommu_device_alive(vdomain->viommu))
+		return -ENODEV;
+
+	/* The queueing failure, or what the device said */
+	if (ret)
+		return ret;
+
+	/* Report what the device said, like the synchronous replay did */
+	return rejected ? (status.err ?: -EIO) : 0;
 }
 
 static int viommu_add_resv_mem(struct viommu_endpoint *vdev,
